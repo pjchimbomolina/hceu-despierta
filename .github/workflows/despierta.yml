@@ -1,0 +1,86 @@
+name: Despierta HCEU
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+# Public repo: no secrets. contents:write is only for a monthly keepalive
+# commit so GitHub does not disable the schedule after 60 days of inactivity.
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tocar HCEU
+        id: ping
+        run: |
+          set +e
+          URL="https://hceu.onrender.com/api/health"
+          echo "Ping $URL at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # A sleeping Render free instance can take about a minute to wake.
+          code=$(curl -sS -o /tmp/hceu-health.body -w "%{http_code}" \
+            --retry 6 --retry-delay 15 --retry-all-errors \
+            --max-time 120 --connect-timeout 30 \
+            -A "hceu-despierta (GitHub Actions)" \
+            "$URL")
+          curl_exit=$?
+          echo "curl_exit=$curl_exit http=$code"
+          if [ -f /tmp/hceu-health.body ]; then
+            echo "body=$(head -c 200 /tmp/hceu-health.body)"
+          fi
+
+          if [ "$code" != "200" ]; then
+            echo "Health no respondió 200; intento la página principal."
+            code=$(curl -sS -o /dev/null -w "%{http_code}" \
+              --retry 3 --retry-delay 10 --retry-all-errors \
+              --max-time 120 --connect-timeout 30 \
+              -A "hceu-despierta (GitHub Actions)" \
+              "https://hceu.onrender.com/")
+            echo "root_http=$code"
+          fi
+
+          echo "http=$code" >> "$GITHUB_OUTPUT"
+
+          if [ "$code" = "200" ]; then
+            echo "HCEU respondió 200."
+            exit 0
+          fi
+
+          echo "No se obtuvo 200."
+          # Manual runs fail so we can confirm the first setup. Scheduled
+          # runs always succeed to avoid noisy failure emails if Render is briefly down.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            exit 1
+          fi
+          exit 0
+
+      - name: Evitar que GitHub apague el horario
+        if: github.event_name == 'schedule'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+
+      - name: Commit mensual de mantenimiento
+        if: github.event_name == 'schedule'
+        run: |
+          set -e
+          # One small commit on the 1st of each month, in the first hour UTC,
+          # so the repository stays "active" and scheduled workflows keep running.
+          if [ "$(date -u +%d%H)" != "0100" ]; then
+            echo "No es el momento de mantenimiento (día/hora UTC $(date -u +%d-%H))."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p .keepalive
+          date -u +%Y-%m-%dT%H:%M:%SZ > .keepalive/last
+          git add .keepalive/last
+          if git diff --staged --quiet; then
+            echo "Nada que confirmar."
+            exit 0
+          fi
+          git commit -m "mantenimiento: $(date -u +%Y-%m)"
+          git push
